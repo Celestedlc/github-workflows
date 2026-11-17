@@ -1,0 +1,64 @@
+name: Reusable Gemini Docs Generator
+
+on:
+  workflow_call:
+    secrets:
+      GEMINI_API_KEY:
+        description: "API Key de Google Gemini para generar el README.md"
+        required: true
+      WORKFLOW_REPO_TOKEN:
+        description: "Token opcional con lectura sobre el repositorio central privado github-workflows"
+        required: false
+
+jobs:
+  update-readme:
+    name: Generate README with Gemini
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          path: target-repo
+
+      - name: Checkout central workflow repository
+        uses: actions/checkout@v4
+        with:
+          repository: Celestedlc/github-workflows
+          ref: main
+          path: workflow-repo
+          token: ${{ secrets.WORKFLOW_REPO_TOKEN || github.token }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install google-genai
+        run: python -m pip install --upgrade pip && pip install google-genai
+
+      - name: Generate or update README.md
+        working-directory: target-repo
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python ../workflow-repo/scripts/generate_docs.py
+
+      - name: Create Pull Request with updated README.md
+        uses: peter-evans/create-pull-request@v7
+        with:
+          path: target-repo
+          branch: docs/auto-update
+          delete-branch: true
+          add-paths: README.md
+          commit-message: "docs: actualizar README.md automáticamente con Gemini"
+          title: "docs: actualizar README.md automáticamente"
+          body: |
+            ## Documentación automática con Gemini
+
+            Este Pull Request actualiza `README.md` de forma automática analizando la estructura y el código del repositorio mediante Gemini (`google-genai`).
+
+            ---
+            *Generado automáticamente por `Celestedlc/github-workflows`.*
