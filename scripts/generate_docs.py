@@ -309,23 +309,23 @@ def _strip_outer_markdown_fence(text: str) -> str:
 
 
 def generate_readme(client: genai.Client, model_name: str, context: str) -> str:
-    """Solicita a Gemini la generación o actualización completa del README.md en español."""
-    prompt = f"""Eres una ingeniera de software senior y technical writer.
-Analiza el código fuente, configuración y estructura del repositorio proporcionados abajo y genera un archivo `README.md` profesional, claro, preciso y completo **en español**.
+    """Solicita a Gemini la generación o actualización completa del README.md en inglés."""
+    prompt = f"""You are a senior software engineer and technical writer.
+Analyze the source code, configuration, and repository structure provided below and generate a clear, accurate, professional, and complete `README.md` **in English**.
 
-Reglas estrictas:
-1. Basa absolutamente todo en los archivos reales del repositorio. NO inventes comandos, dependencias, endpoints, variables de entorno ni características que no existan en el código.
-2. Si existe un `README.md` previo, actualiza la información obsoleta y conserva solo lo que siga siendo verídico respecto al código actual.
-3. Devuelve únicamente el contenido Markdown puro del `README.md` (sin explicaciones previas ni bloques ```markdown envolviendo todo el documento).
-4. Incluye obligatoriamente estas secciones adaptadas al proyecto real:
-   - Título y **Descripción** clara del proyecto (qué hace y para qué sirve).
-   - **Arquitectura** (componentes principales, flujo de ejecución/datos y tecnologías usadas).
-   - **Requisitos** (versiones de lenguaje, herramientas CLI, dependencias o variables de entorno reales detectadas).
-   - **Instalación** (pasos exactos deducibles del proyecto).
-   - **Uso real** (comandos, scripts, endpoints o ejemplos basados en el código real).
-   - **Estructura de archivos** (resumen claro basado en el árbol real del repositorio).
+Strict rules:
+1. Base everything strictly on the actual repository files. Do NOT invent commands, dependencies, endpoints, environment variables, or features that do not exist in the code.
+2. If an existing `README.md` is provided, update any outdated information and keep only what remains true according to the current codebase.
+3. Return ONLY the raw Markdown content of `README.md` (no introductory text and no outer ```markdown fences wrapping the entire document).
+4. Include these sections tailored to the actual project:
+   - Title and clear **Description** of the project (what it does and why it exists).
+   - **Architecture** (main components, execution/data flow, and technologies used).
+   - **Requirements** (language versions, CLI tools, dependencies, or environment variables detected in the code).
+   - **Installation** (exact setup steps derived from the project).
+   - **Usage** (real commands, scripts, endpoints, or examples based on the actual code).
+   - **File Structure** (clear summary based on the real repository tree).
 
-Contexto del repositorio:
+Repository context:
 {context}
 """
     response = client.models.generate_content(model=model_name, contents=prompt)
