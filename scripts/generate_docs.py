@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import os
+import random
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -18,14 +20,18 @@ MAX_TOTAL_CONTEXT_CHARS = 400_000
 MAX_EXISTING_README_CHARS = 20_000
 
 PREFERRED_MODEL_ALIASES = (
+    "gemini-3.8-flash",
     "gemini-flash-latest",
     "gemini-pro-latest",
-    "gemini-2.5-flash",
 )
 
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+FATAL_STATUS_CODES = frozenset({400, 401, 403})
+
 EXCLUDED_VARIANT_RE = re.compile(
-    r"(?:^|[-_.])(lite|8b|vision)(?:$|[-_.])", re.IGNORECASE
+    r"(?:^|[-_.])(8b|vision)(?:$|[-_.])", re.IGNORECASE
 )
+LITE_VARIANT_RE = re.compile(r"(?:^|[-_.])lite(?:$|[-_.])", re.IGNORECASE)
 NON_TEXT_VARIANT_RE = re.compile(
     r"(?:^|[-_.])(tts|image|audio|live|robotics|computer-use|embedding|aqa|imagen|veo)(?:$|[-_.])",
     re.IGNORECASE,
@@ -114,7 +120,7 @@ def _create_client() -> genai.Client:
 
 
 def _model_recency_key(model_id: str) -> tuple[int, int, int, tuple[int, ...], str]:
-    """Genera una clave ordenable para priorizar el modelo flash más reciente."""
+    """Genera una clave ordenable para priorizar el modelo más reciente y estable."""
     lower = model_id.lower()
     match = VERSION_RE.match(lower)
     major = int(match.group(1)) if match else 0
@@ -128,27 +134,18 @@ def _model_recency_key(model_id: str) -> tuple[int, int, int, tuple[int, ...], s
     return (major, minor, is_stable, extra_nums, lower)
 
 
-def _select_best_flash_model(candidates: Iterable[str]) -> str | None:
-    """Elige el modelo flash más reciente descartando variantes lite, 8b o vision."""
-    flash_models = [
-        m
-        for m in candidates
-        if "gemini" in m.lower()
-        and "flash" in m.lower()
-        and not EXCLUDED_VARIANT_RE.search(m)
-    ]
-    if not flash_models:
-        return None
-
-    clean_text_models = [
-        m for m in flash_models if not NON_TEXT_VARIANT_RE.search(m)
-    ]
-    pool = clean_text_models or flash_models
-    return max(pool, key=_model_recency_key)
+def _unique_preserve_order(items: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
 
 
-def get_working_model(client: genai.Client | None = None) -> str:
-    """Obtiene un modelo Gemini válido para generateContent a prueba de deprecaciones."""
+def get_candidate_models(client: genai.Client | None = None) -> list[str]:
+    """Construye una lista priorizada de modelos Gemini compatibles con generateContent."""
     if client is None:
         client = _create_client()
 
@@ -162,27 +159,49 @@ def get_working_model(client: genai.Client | None = None) -> str:
         available_ids.append(model_id)
 
     available_set = set(available_ids)
-    for alias in PREFERRED_MODEL_ALIASES:
-        if alias in available_set:
-            return alias
 
-    best_flash = _select_best_flash_model(available_ids)
-    if best_flash:
-        return best_flash
-
-    text_candidates = [
+    clean_text = [
         m
         for m in available_ids
         if "gemini" in m.lower()
         and not EXCLUDED_VARIANT_RE.search(m)
         and not NON_TEXT_VARIANT_RE.search(m)
     ]
-    if text_candidates:
-        return max(text_candidates, key=_model_recency_key)
 
-    raise RuntimeError(
-        "No se encontró ningún modelo compatible con generateContent en client.models.list()."
+    # 1. Alias preferidos presentes en la API
+    preferred = [alias for alias in PREFERRED_MODEL_ALIASES if alias in available_set]
+
+    # 2. Modelos flash estándar ordenados de más reciente a más antiguo
+    flash_standard = sorted(
+        [m for m in clean_text if "flash" in m.lower() and not LITE_VARIANT_RE.search(m)],
+        key=_model_recency_key,
+        reverse=True,
     )
+
+    # 3. Modelos flash-lite como respaldo rápido cuando flash estándar tiene 503
+    flash_lite = sorted(
+        [m for m in clean_text if "flash" in m.lower() and LITE_VARIANT_RE.search(m)],
+        key=_model_recency_key,
+        reverse=True,
+    )
+
+    # 4. Resto de modelos de texto (ej. pro) como último respaldo
+    other_text = sorted(
+        [m for m in clean_text if "flash" not in m.lower()],
+        key=_model_recency_key,
+        reverse=True,
+    )
+
+    candidates = _unique_preserve_order(
+        [*preferred, *flash_standard, *flash_lite, *other_text]
+    )
+
+    if not candidates:
+        raise RuntimeError(
+            "No se encontró ningún modelo compatible con generateContent en client.models.list()."
+        )
+
+    return candidates
 
 
 def _list_tracked_files(repo_root: Path) -> list[str]:
@@ -308,9 +327,8 @@ def _strip_outer_markdown_fence(text: str) -> str:
     return stripped + "\n"
 
 
-def generate_readme(client: genai.Client, model_name: str, context: str) -> str:
-    """Solicita a Gemini la generación o actualización completa del README.md en inglés."""
-    prompt = f"""You are a senior software engineer and technical writer.
+def _build_prompt(context: str) -> str:
+    return f"""You are a senior software engineer and technical writer.
 Analyze the source code, configuration, and repository structure provided below and generate a clear, accurate, professional, and complete `README.md` **in English**.
 
 Strict rules:
@@ -318,16 +336,20 @@ Strict rules:
 2. If an existing `README.md` is provided, update any outdated information and keep only what remains true according to the current codebase.
 3. Return ONLY the raw Markdown content of `README.md` (no introductory text and no outer ```markdown fences wrapping the entire document).
 4. Include these sections tailored to the actual project:
-   - Title and clear **Description** of the project (what it does and why it exists).
-   - **Architecture** (main components, execution/data flow, and technologies used).
-   - **Requirements** (language versions, CLI tools, dependencies, or environment variables detected in the code).
-   - **Installation** (exact setup steps derived from the project).
-   - **Usage** (real commands, scripts, endpoints, or examples based on the actual code).
-   - **File Structure** (clear summary based on the real repository tree).
+  - Title and clear **Description** of the project (what it does and why it exists).
+  - **Architecture** (main components, execution/data flow, and technologies used).
+  - **Requirements** (language versions, CLI tools, dependencies, or environment variables detected in the code).
+  - **Installation** (exact setup steps derived from the project).
+  - **Usage** (real commands, scripts, endpoints, or examples based on the actual code).
+  - **File Structure** (clear summary based on the real repository tree).
 
 Repository context:
 {context}
 """
+
+
+def generate_readme(client: genai.Client, model_name: str, prompt: str) -> str:
+    """Solicita a Gemini la generación o actualización completa del README.md en inglés."""
     response = client.models.generate_content(model=model_name, contents=prompt)
     text = getattr(response, "text", None)
     if not text or not text.strip():
@@ -335,48 +357,112 @@ Repository context:
     return _strip_outer_markdown_fence(text)
 
 
+def generate_readme_with_retries(
+    client: genai.Client, candidate_models: list[str], context: str
+) -> str:
+    """Reintenta rotando entre modelos disponibles hasta lograr generar el README."""
+    prompt = _build_prompt(context)
+    active_models = list(candidate_models)
+    round_num = 0
+
+    while active_models:
+        round_num += 1
+        for model_name in list(active_models):
+            try:
+                print(
+                    f"[generate_docs] Ronda #{round_num} - Probando '{model_name}'...",
+                    flush=True,
+                )
+                content = generate_readme(client, model_name, prompt)
+                print(
+                    f"[generate_docs] README generado correctamente con '{model_name}'.",
+                    flush=True,
+                )
+                return content
+
+            except errors.APIError as exc:
+                code = getattr(exc, "code", None)
+                if code == 404:
+                    print(
+                        f"[generate_docs] '{model_name}' devolvió 404 (no disponible); descartado.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    active_models.remove(model_name)
+                    continue
+
+                if code in FATAL_STATUS_CODES:
+                    raise
+
+                if code in RETRYABLE_STATUS_CODES:
+                    print(
+                        f"[generate_docs] '{model_name}' ocupado/temporalmente no disponible (HTTP {code}). Probando siguiente...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+
+                print(
+                    f"[generate_docs] Error de API con '{model_name}' ({exc}). Probando siguiente...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            except Exception as exc:
+                print(
+                    f"[generate_docs] Error temporal con '{model_name}': {exc}. Probando siguiente...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+        if not active_models:
+            break
+
+        wait_seconds = min(10 * round_num, 60) + random.uniform(1.0, 5.0)
+        print(
+            f"[generate_docs] Todos los modelos ocupados en la ronda #{round_num}. "
+            f"Esperando {wait_seconds:.1f}s antes de reintentar...",
+            flush=True,
+        )
+        time.sleep(wait_seconds)
+
+    raise RuntimeError(
+        "No quedó ningún modelo válido disponible tras descartar los que devolvieron 404."
+    )
+
+
 def main() -> int:
     repo_root = Path.cwd()
     try:
         client = _create_client()
-        model_name = get_working_model(client)
-        print(f"[generate_docs] Modelo seleccionado: {model_name}")
+        candidate_models = get_candidate_models(client)
+        print(
+            f"[generate_docs] Modelos candidatos ({len(candidate_models)}): "
+            f"{', '.join(candidate_models[:5])}"
+            + (" ..." if len(candidate_models) > 5 else ""),
+            flush=True,
+        )
 
         context, included_count, total_tracked = build_project_context(repo_root)
         print(
             f"[generate_docs] Contexto construido: {included_count} archivos leídos "
-            f"de {total_tracked} trackeados."
+            f"de {total_tracked} trackeados.",
+            flush=True,
         )
 
-        try:
-            readme_content = generate_readme(client, model_name, context)
-        except errors.APIError as exc:
-            # Respaldo adicional si un alias falla en tiempo de inferencia
-            print(
-                f"[generate_docs] Fallo con '{model_name}' ({exc}); buscando modelo alternativo...",
-                file=sys.stderr,
-            )
-            fallback_candidates = [
-                m
-                for m in (
-                    getattr(item, "name", "").removeprefix("models/")
-                    for item in client.models.list()
-                    if "generateContent" in (getattr(item, "supported_actions", None) or [])
-                )
-                if m and m != model_name
-            ]
-            fallback_model = _select_best_flash_model(fallback_candidates)
-            if not fallback_model:
-                raise
-            print(f"[generate_docs] Reintentando con: {fallback_model}")
-            readme_content = generate_readme(client, fallback_model, context)
+        readme_content = generate_readme_with_retries(client, candidate_models, context)
 
         output_path = repo_root / "README.md"
         output_path.write_text(readme_content, encoding="utf-8")
-        print(f"[generate_docs] README.md actualizado correctamente en {output_path}")
+        print(
+            f"[generate_docs] README.md actualizado correctamente en {output_path}",
+            flush=True,
+        )
         return 0
     except Exception as exc:
-        print(f"[generate_docs] Error: {exc}", file=sys.stderr)
+        print(f"[generate_docs] Error: {exc}", file=sys.stderr, flush=True)
         return 1
 
 
